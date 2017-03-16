@@ -17,11 +17,13 @@ package com.impetus.client.mongodb.query;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
 import java.util.Queue;
 import java.util.StringTokenizer;
+import java.util.regex.Pattern;
 
 import javax.persistence.Query;
 import javax.persistence.metamodel.Attribute;
@@ -30,9 +32,12 @@ import javax.persistence.metamodel.EntityType;
 import javax.persistence.metamodel.Metamodel;
 
 import org.apache.commons.lang.StringUtils;
+import org.eclipse.persistence.jpa.jpql.parser.AggregateFunction;
+import org.eclipse.persistence.jpa.jpql.parser.CollectionExpression;
 import org.eclipse.persistence.jpa.jpql.parser.CountFunction;
 import org.eclipse.persistence.jpa.jpql.parser.Expression;
 import org.eclipse.persistence.jpa.jpql.parser.SelectClause;
+import org.eclipse.persistence.jpa.jpql.parser.StateFieldPathExpression;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -63,6 +68,7 @@ import com.impetus.kundera.query.KunderaQuery.SortOrdering;
 import com.impetus.kundera.query.KunderaQuery.UpdateClause;
 import com.impetus.kundera.query.QueryHandlerException;
 import com.impetus.kundera.query.QueryImpl;
+import com.mongodb.DBObject;
 import com.mongodb.BasicDBObject;
 
 /**
@@ -153,7 +159,15 @@ public class MongoDBQuery extends QueryImpl
                 return ((MongoDBClient) client).executeQuery(query == null ? getJPAQuery() : query, m);
             }
 
-            if (MetadataUtils.useSecondryIndex(((ClientBase) client).getClientMetadata()))
+            if (kunderaQuery.isAggregated())
+            {
+                return ((MongoDBClient) client).aggregate(m,
+                      createMongoQuery(m, getKunderaQuery().getFilterClauseQueue()),
+                      createAggregation(m),
+                      getAggregationOrderByClause(m),
+                      isSingleResult ? 1 : maxResult);
+            }
+            else if (MetadataUtils.useSecondryIndex(((ClientBase) client).getClientMetadata()))
             {
                 BasicDBObject orderByClause = getOrderByClause(m);
                 return ((MongoDBClient) client).loadData(m,
@@ -326,7 +340,9 @@ public class MongoDBQuery extends QueryImpl
         if (sq.clauses.size() > 0 || hasChildren)
         {
             if (sq.clauses.size() > 0)
+            {
                 sq.actualQuery = createSubMongoQuery(m, sq.clauses);
+            }
             if (hasChildren)
             {
                 List<BasicDBObject> childQs = new ArrayList<BasicDBObject>();
@@ -336,7 +352,11 @@ public class MongoDBQuery extends QueryImpl
                 {
                     childQs.add(subQ.actualQuery);
                 }
-                if (sq.isAnd)
+                if (childQs.size() == 1)
+                {
+                    sq.actualQuery = childQs.get(0);
+                }
+                else if (sq.isAnd)
                 {
                     BasicDBObject dbo = new BasicDBObject("$and", childQs);
                     sq.actualQuery = dbo;
@@ -348,7 +368,6 @@ public class MongoDBQuery extends QueryImpl
                 }
             }
         }
-        return;
     }
 
     /**
@@ -443,7 +462,17 @@ public class MongoDBQuery extends QueryImpl
                 FilterClause filter = (FilterClause) object;
                 String property = filter.getProperty();
                 String condition = filter.getCondition();
-                Object value = filter.getValue().get(0);
+                boolean ignoreCase = filter.isIgnoreCase();
+
+                Object value;
+                if (filter.getValue().size() == 1)
+                {
+                    value = filter.getValue().get(0);
+                }
+                else
+                {
+                    value = filter.getValue();
+                }
 
                 // value is string but field.getType is different, then get
                 // value using
@@ -521,13 +550,17 @@ public class MongoDBQuery extends QueryImpl
                             f = (Field) entity.getAttribute(fieldName).getJavaMember();
                         }
                     }
-                    if (value.getClass().isAssignableFrom(String.class) && f != null
-                            && !f.getType().equals(value.getClass()))
+
+                    if (value != null)
                     {
-                        value = PropertyAccessorFactory.getPropertyAccessor(f).fromString(f.getType().getClass(),
-                                value.toString());
+                        if (value.getClass().isAssignableFrom(String.class) && f != null
+                                && !f.getType().equals(value.getClass()))
+                        {
+                            value = PropertyAccessorFactory.getPropertyAccessor(f).fromString(f.getType().getClass(),
+                                    value.toString());
+                        }
+                        value = MongoDBUtils.populateValue(value, value.getClass());
                     }
-                    value = MongoDBUtils.populateValue(value, value.getClass());
 
                 }
 
@@ -555,122 +588,114 @@ public class MongoDBQuery extends QueryImpl
 
                         property = new StringBuffer("_id.").append(attribute.getJPAColumnName()).toString();
                     }
-                    if (condition.equals("="))
-                    {
-                        query.append(property, value);
 
+                    if (ignoreCase)
+                    {
+                        // let 'like' and 'not like' take care of this on its own
+                        if (!condition.equalsIgnoreCase("like") && !condition.equalsIgnoreCase("not like")) {
+
+                            if (value instanceof String)
+                            {
+                                value = Pattern.compile(createLikeRegex((String) value, ignoreCase));
+
+                            }
+                            else if (value instanceof Collection)
+                            {
+                                Collection<?> original = (Collection<?>) value;
+                                List<Pattern> values = new ArrayList<Pattern>(original.size());
+
+                                for (Object item : original)
+                                {
+                                    values.add(Pattern.compile(createLikeRegex((String) item, ignoreCase)));
+                                }
+
+                                value = values;
+
+                            }
+                        }
                     }
-                    else if (condition.equalsIgnoreCase("like"))
+
+                    if (condition.equals("="))
                     {
 
                         if (query.containsField(property))
                         {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$regex",
-                                    createLikeRegex((String) value)));
+                            appendToQuery(query, property, "$eq", value);
                         }
                         else
                         {
-                            query.append(property, new BasicDBObject("$regex", createLikeRegex((String) value)));
+                            query.append(property, value);
                         }
+
+                    }
+                    else if (condition.equalsIgnoreCase("is null"))
+                    {
+                        if (query.containsField(property))
+                        {
+                            appendToQuery(query, property, "$eq", null);
+                        }
+                        else
+                        {
+                            query.append(property, null);
+                        }
+                    }
+                    else if (condition.toLowerCase().contains("like"))
+                    {
+
+                        Pattern regEx = Pattern.compile(createLikeRegex((String) value, ignoreCase));
+                        boolean negative = condition.toLowerCase().contains("not");
+
+                        appendToQuery(query, property, negative ? "$not" : "$regex", regEx);
 
                     }
                     else if (condition.equalsIgnoreCase(">"))
                     {
 
-                        if (query.containsField(property))
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$gt", value));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$gt", value));
-                        }
+                        appendToQuery(query, property, "$gt", value);
+
                     }
                     else if (condition.equalsIgnoreCase(">="))
                     {
 
-                        if (query.containsField(property))
-
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$gte", value));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$gte", value));
-                        }
+                        appendToQuery(query, property, "$gte", value);
 
                     }
                     else if (condition.equalsIgnoreCase("<"))
                     {
 
-                        if (query.containsField(property))
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$lt", value));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$lt", value));
-                        }
+                        appendToQuery(query, property, "$lt", value);
 
                     }
                     else if (condition.equalsIgnoreCase("<="))
                     {
 
-                        if (query.containsField(property))
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$lte", value));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$lte", value));
-                        }
+                        appendToQuery(query, property, "$lte", value);
 
                     }
                     else if (condition.equalsIgnoreCase("in"))
                     {
 
-                        if (query.containsField(property))
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$in", filter.getValue()));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$in", filter.getValue()));
-                        }
+                        appendToQuery(query, property, "$in", value);
 
                     }
                     else if (condition.equalsIgnoreCase("not in"))
                     {
 
-                        if (query.containsField(property))
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$nin", filter.getValue()));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$nin", filter.getValue()));
-                        }
+                        appendToQuery(query, property, "$nin", value);
 
                     }
                     else if (condition.equalsIgnoreCase("<>"))
                     {
 
-                        if (query.containsField(property))
-                        {
-                            query.get(property);
-                            query.put(property, ((BasicDBObject) query.get(property)).append("$ne", value));
-                        }
-                        else
-                        {
-                            query.append(property, new BasicDBObject("$ne", value));
-                        }
+                        String operator = value instanceof Pattern ? "$not" : "$ne";
+
+                        appendToQuery(query, property, operator, value);
+
+                    }
+                    else if (condition.equalsIgnoreCase("is not null"))
+                    {
+
+                        appendToQuery(query, property, "$not", null);
 
                     }
                 }
@@ -685,6 +710,24 @@ public class MongoDBQuery extends QueryImpl
         }
 
         return query;
+    }
+
+    private void appendToQuery(BasicDBObject query, String property, String operator, Object value) {
+        if (query.containsField(property))
+        {
+            Object existing = query.get(property);
+
+            if (!(existing instanceof BasicDBObject))
+            {
+                query.put(property, new BasicDBObject("$eq", existing));
+            }
+
+            query.put(property, ((BasicDBObject) query.get(property)).append(operator, value));
+        }
+        else
+        {
+            query.append(property, new BasicDBObject(operator, value));
+        }
     }
 
     /**
@@ -721,6 +764,97 @@ public class MongoDBQuery extends QueryImpl
     }
 
     /**
+     * Get the aggregation object.
+     *
+     * @param metadata
+     * @return
+     */
+    private BasicDBObject createAggregation(EntityMetadata metadata)
+    {
+        if (kunderaQuery.getSelectStatement() != null)
+        {
+            Metamodel metaModel = kunderaMetadata.getApplicationMetadata().getMetamodel(metadata.getPersistenceUnit());
+            EntityType entityType = metaModel.entity(metadata.getEntityClazz());
+
+            BasicDBObject aggregation = new BasicDBObject();
+
+            SelectClause selectClause = (SelectClause) kunderaQuery.getSelectStatement().getSelectClause();
+            Expression expression = selectClause.getSelectExpression();
+
+            buildAggregation(aggregation, expression, metadata, entityType);
+
+            if (!aggregation.containsField("_id"))
+            {
+                aggregation.put("_id", null);
+            }
+
+            return aggregation;
+        }
+
+        return null;
+    }
+
+    /**
+     * Build the aggregation parameters.
+     *
+     * @param group
+     * @param expression
+     * @param metadata
+     * @param entityType
+     */
+    private void buildAggregation(DBObject group, Expression expression,
+                                  EntityMetadata metadata, EntityType entityType)
+    {
+        if (expression instanceof AggregateFunction)
+        {
+            AggregateFunction aggregateFunction = (AggregateFunction) expression;
+            String identifier = aggregateFunction.getIdentifier().toLowerCase();
+
+            Expression child = aggregateFunction.getExpression();
+
+            if (child instanceof StateFieldPathExpression)
+            {
+                StateFieldPathExpression sfpExp = (StateFieldPathExpression) child;
+                String columnName = getColumnName(metadata, entityType, sfpExp.toActualText());
+
+                BasicDBObject item = new BasicDBObject("$" + identifier, "$" + columnName);
+                group.put(identifier + "_" + columnName, item);
+            }
+            else if (expression instanceof CountFunction)
+            {
+                group.put("count", new BasicDBObject("$sum", 1));
+            }
+        }
+        else if (expression instanceof CollectionExpression)
+        {
+            for (Expression child : expression.children())
+            {
+                buildAggregation(group, child, metadata, entityType);
+            }
+        }
+        else if (expression instanceof StateFieldPathExpression)
+        {
+            StateFieldPathExpression sfpExp = (StateFieldPathExpression) expression;
+
+            BasicDBObject idObject;
+            Object existing = group.get("_id");
+            if (existing != null)
+            {
+                idObject = (BasicDBObject) existing;
+            }
+            else
+            {
+                idObject = new BasicDBObject();
+                group.put("_id", idObject);
+            }
+
+            String columnName = getColumnName(metadata, entityType, sfpExp.toActualText());
+
+            idObject.put(columnName, "$" + columnName);
+        }
+    }
+
+    /**
      * Prepare order by clause.
      * 
      * @param metadata
@@ -754,6 +888,51 @@ public class MongoDBQuery extends QueryImpl
                 {
                     orderByClause.append("metadata." + getColumnName(metadata, entityType, order.getColumnName()),
                             order.getOrder().equals(SortOrder.ASC) ? 1 : -1);
+                }
+            }
+        }
+
+        return orderByClause;
+    }
+
+    private BasicDBObject getAggregationOrderByClause(final EntityMetadata metadata)
+    {
+        BasicDBObject orderByClause = null;
+        Metamodel metaModel = kunderaMetadata.getApplicationMetadata().getMetamodel(metadata.getPersistenceUnit());
+        EntityType entityType = metaModel.entity(metadata.getEntityClazz());
+
+        AbstractManagedType managedType = (AbstractManagedType) metaModel.entity(metadata.getEntityClazz());
+
+        List<SortOrdering> orders = kunderaQuery.getOrdering();
+        if (orders != null)
+        {
+            orderByClause = new BasicDBObject();
+            if (!managedType.hasLobAttribute())
+            {
+                for (SortOrdering order : orders)
+                {
+                    if (order.getColumnName().contains("("))
+                    {
+                        String function = order.getColumnName().replaceFirst("\\s*(.*?)\\s*\\(.*", "$1");
+                        String property = order.getColumnName().replaceFirst(".*?\\(\\s*(.*)\\s*\\).*", "$1");
+                        String columnName = getColumnName(metadata, entityType, property);
+
+                        orderByClause.append(function.toLowerCase() + "_" + columnName,
+                              order.getOrder().equals(SortOrder.ASC) ? 1 : -1);
+                    }
+                    else
+                    {
+                        orderByClause.append(getColumnName(metadata, entityType, order.getColumnName()),
+                              order.getOrder().equals(SortOrder.ASC) ? 1 : -1);
+                    }
+                }
+            }
+            else
+            {
+                for (SortOrdering order : orders)
+                {
+                    orderByClause.append("metadata." + getColumnName(metadata, entityType, order.getColumnName()),
+                          order.getOrder().equals(SortOrder.ASC) ? 1 : -1);
                 }
             }
         }
@@ -929,11 +1108,13 @@ public class MongoDBQuery extends QueryImpl
      * 
      * @param expr
      *            the expr
+     * @param ignoreCase
+     *            whether to ignore the case
      * @return the string
      */
-    public static String createLikeRegex(String expr)
+    public static String createLikeRegex(String expr, boolean ignoreCase)
     {
-        String regex = createRegex(expr);
+        String regex = createRegex(expr, ignoreCase);
         regex = regex.replace("_", ".").replace("%", ".*?");
 
         return regex;
@@ -944,9 +1125,11 @@ public class MongoDBQuery extends QueryImpl
      * 
      * @param value
      *            the value
+     * @param ignoreCase
+     *            whether to ignore the case
      * @return the string
      */
-    public static String createRegex(String value)
+    public static String createRegex(String value, boolean ignoreCase)
     {
         if (value == null)
         {
@@ -960,7 +1143,13 @@ public class MongoDBQuery extends QueryImpl
         }
 
         StringBuilder sb = new StringBuilder(len * 2);
-        sb.append("(?i)^");
+
+        if (ignoreCase) {
+            sb.append("(?i)");
+        }
+
+        sb.append("^");
+
         for (int i = 0; i < len; i++)
         {
             char c = value.charAt(i);
